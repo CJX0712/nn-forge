@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>NNForge — 神经网络锻造炉</title>
+<style>
+  :root{ --bg:#0d1117; --panel:#161b22; --edge:#30363d; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --bad:#f85149; }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{ background:var(--bg); color:var(--fg); font:14px/1.5 Consolas,"Microsoft YaHei",monospace; padding:20px; }
+  h1{ font-size:20px; color:var(--acc); margin-bottom:4px; }
+  .sub{ color:var(--dim); margin-bottom:14px; }
+  .wrap{ display:flex; gap:18px; flex-wrap:wrap; }
+  .panel{ background:var(--panel); border:1px solid var(--edge); border-radius:8px; padding:14px; }
+  canvas{ display:block; border:1px solid var(--edge); border-radius:6px; background:#0a0d12; }
+  .row{ display:flex; align-items:center; gap:10px; margin:8px 0; flex-wrap:wrap; }
+  button{ background:#21262d; color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:6px 14px; cursor:pointer; font:inherit; }
+  button:hover{ border-color:var(--acc); color:var(--acc); }
+  button.primary{ background:#1f427a; border-color:var(--acc); }
+  button.active{ background:#7a3b1f; border-color:#f0883e; color:#f0883e; }
+  input[type=range]{ width:120px; }
+  select{ background:#21262d; color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:5px 8px; font:inherit; }
+  .stat{ color:var(--dim); } .stat b{ color:var(--fg); }
+  #test{ margin-top:14px; }
+  .t{ padding:2px 0; } .pass{ color:var(--ok); } .fail{ color:var(--bad); }
+  .cols{ column-count:2; column-gap:24px; }
+  @media (max-width:1100px){ .cols{ column-count:1; } }
+</style>
+</head>
+<body>
+<h1>✦ NNForge — 神经网络锻造炉</h1>
+<div class="sub">纯 JS 手写 MLP + 反向传播 · 梯度检验 &lt;1e-4 · XOR/月牙/螺旋/环形 · 浏览器内实时训练决策边界 · 单文件离线</div>
+
+<div class="wrap">
+  <div class="panel">
+    <canvas id="cv" width="420" height="420"></canvas>
+    <div class="legend" style="margin-top:8px;color:var(--dim);font-size:12px">
+      <span style="color:#f85149">■ 类 0</span>&nbsp;&nbsp;<span style="color:#3fb950">■ 类 1</span>&nbsp;&nbsp;背景 = 决策边界热区（红→绿 概率 0→1）
+    </div>
+  </div>
+
+  <div class="panel" style="flex:1 1 340px; min-width:300px">
+    <div class="row">
+      <select id="dataset">
+        <option value="xor">XOR（异或）</option>
+        <option value="moons">双月牙</option>
+        <option value="circle">环形</option>
+        <option value="spiral">双螺旋</option>
+      </select>
+      <button id="bRegen" class="primary">重新采样</button>
+      <button id="bTrain" class="primary">▶ 训练</button>
+      <button id="bReset">重置网络</button>
+    </div>
+    <div class="row">
+      <span class="stat">学习率</span><input type="range" id="lr" min="1" max="50" value="8">
+      <span class="stat" id="lrV">0.8</span>
+      <span class="stat">隐藏层</span>
+      <select id="arch"><option value="8">[8]</option><option value="8,8" selected>[8,8]</option><option value="16,16">[16,16]</option></select>
+    </div>
+    <div class="row stat">epoch <b id="sEpoch">0</b> · loss <b id="sLoss">—</b> · 训练精度 <b id="sAcc">—</b></div>
+    <canvas id="lossCv" width="420" height="110" style="margin-top:6px"></canvas>
+    <div class="row stat" id="info">状态：待命 · 提示：梯度检验已内置（解析 vs 数值差分）</div>
+    <div id="test"><div class="row" style="color:var(--dim)">引擎自检 <button id="bTest" style="padding:2px 10px">运行</button></div><div id="tout" class="cols"></div></div>
+  </div>
+</div>
+
+<script id="engine">
+const NN = (function(){
+  'use strict';
+
+  function mulberry32(seed){
+    let t = seed >>> 0;
+    return function(){
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const tanh = Math.tanh;
+  function sigmoid(z){ return 1 / (1 + Math.exp(-z)); }
+
+  // net: { sizes:[2,8,8,1], W:[out*in flat arrays], b:[out arrays] }
+  function create(sizes, seed){
+    const rnd = mulberry32(seed);
+    const W = [], b = [];
+    for (let l = 0; l < sizes.length - 1; l++){
+      const nin = sizes[l], nout = sizes[l + 1];
+      const w = new Float64Array(nout * nin);
+      const scale = Math.sqrt(2 / (nin + nout)); // Xavier-ish
+      for (let i = 0; i < w.length; i++) w[i] = (rnd() * 2 - 1) * scale * 2.4;
+      W.push(w);
+      b.push(new Float64Array(nout));
+    }
+    return { sizes: sizes.slice(), W: W, b: b };
+  }
+
+  // forward, returns {a: activations per layer (a[0]=input), z: pre-activations}
+  function forward(net, x){
+    const a = [Float64Array.from(x)], z = [];
+    for (let l = 0; l < net.W.length; l++){
+      const nin = net.sizes[l], nout = net.sizes[l + 1];
+      const zi = new Float64Array(nout), ai = new Float64Array(nout);
+      const wl = net.W[l], bl = net.b[l], prev = a[l];
+      for (let o = 0; o < nout; o++){
+        let s = bl[o];
+        const row = o * nin;
+        for (let i = 0; i < nin; i++) s += wl[row + i] * prev[i];
+        zi[o] = s;
+        ai[o] = l < net.W.length - 1 ? tanh(s) : sigmoid(s);
+      }
+      z.push(zi); a.push(ai);
+    }
+    return { a: a, z: z };
+  }
+
+  function predict(net, x){ return forward(net, x).a[net.W.length][0]; }
+
+  function lossBCE(p, y){
+    const eps = 1e-12;
+    const pc = Math.min(1 - eps, Math.max(eps, p));
+    return -(y * Math.log(pc) + (1 - y) * Math.log(1 - pc));
+  }
+
+  // full-batch backprop; returns {loss, gW, gB} — deltas: out = p - y (BCE+sigmoid), hidden = (W^T d) ∘ (1 - a^2)
+  function grads(net, X, Y){
+    const L = net.W.length;
+    const gW = net.W.map(w => new Float64Array(w.length));
+    const gB = net.b.map(b => new Float64Array(b.length));
+    let loss = 0;
+    for (let n = 0; n < X.length; n++){
+      const f = forward(net, X[n]);
+      const p = f.a[L][0], y = Y[n];
+      loss += lossBCE(p, y);
+      let delta = new Float64Array([p - y]);          // dL/dz_out
+      for (let l = L - 1; l >= 0; l--){
+        const nin = net.sizes[l], nout = net.sizes[l + 1];
+        const aPrev = f.a[l], wl = net.W[l];
+        const gw = gW[l], gb = gB[l];
+        for (let o = 0; o < nout; o++){
+          gb[o] += delta[o];
+          const row = o * nin;
+          for (let i = 0; i < nin; i++) gw[row + i] += delta[o] * aPrev[i];
+        }
+        if (l > 0){
+          const dPrev = new Float64Array(nin);
+          for (let i = 0; i < nin; i++){
+            let s = 0;
+            for (let o = 0; o < nout; o++) s += wl[o * nin + i] * delta[o];
+            dPrev[i] = s * (1 - aPrev[i] * aPrev[i]); // tanh'
+          }
+          delta = dPrev;
+        }
+      }
+    }
+    const m = X.length;
+    for (let l = 0; l < L; l++){
+      for (let i = 0; i < gW[l].length; i++) gW[l][i] /= m;
+      for (let i = 0; i < gB[l].length; i++) gB[l][i] /= m;
+    }
+    return { loss: loss / m, gW: gW, gB: gB };
+  }
+
+  function applyGrad(net, g, lr){
+    for (let l = 0; l < net.W.length; l++){
+      for (let i = 0; i < net.W[l].length; i++) net.W[l][i] -= lr * g.gW[l][i];
+      for (let i = 0; i < net.b[l].length; i++) net.b[l][i] -= lr * g.gB[l][i];
+    }
+  }
+
+  function trainEpoch(net, X, Y, lr){
+    const g = grads(net, X, Y);
+    applyGrad(net, g, lr);
+    return g.loss;
+  }
+
+  function accuracy(net, X, Y){
+    let c = 0;
+    for (let n = 0; n < X.length; n++) if ((predict(net, X[n]) >= 0.5 ? 1 : 0) === Y[n]) c++;
+    return c / X.length;
+  }
+
+  // numerical gradient (central difference) for gradient checking
+  function numericalGrads(net, X, Y, eps){
+    eps = eps || 1e-6;
+    const gW = net.W.map(w => new Float64Array(w.length));
+    const gB = net.b.map(b => new Float64Array(b.length));
+    function totalLoss(){
+      let s = 0;
+      for (let n = 0; n < X.length; n++) s += lossBCE(predict(net, X[n]), Y[n]);
+      return s / X.length;
+    }
+    for (let l = 0; l < net.W.length; l++){
+      for (let i = 0; i < net.W[l].length; i++){
+        const orig = net.W[l][i];
+        net.W[l][i] = orig + eps; const lp = totalLoss();
+        net.W[l][i] = orig - eps; const lm = totalLoss();
+        net.W[l][i] = orig;
+        gW[l][i] = (lp - lm) / (2 * eps);
+      }
+      for (let i = 0; i < net.b[l].length; i++){
+        const orig = net.b[l][i];
+        net.b[l][i] = orig + eps; const lp = totalLoss();
+        net.b[l][i] = orig - eps; const lm = totalLoss();
+        net.b[l][i] = orig;
+        gB[l][i] = (lp - lm) / (2 * eps);
+      }
+    }
+    return { gW: gW, gB: gB };
+  }
+
+  function maxRelErr(g1, g2){
+    let m = 0;
+    for (let l = 0; l < g1.gW.length; l++){
+      for (let i = 0; i < g1.gW[l].length; i++){
+        const a = g1.gW[l][i], b = g2.gW[l][i];
+        const err = Math.abs(a - b) / Math.max(1e-8, Math.abs(a) + Math.abs(b));
+        if (err > m) m = err;
+      }
+      for (let i = 0; i < g1.gB[l].length; i++){
+        const a = g1.gB[l][i], b = g2.gB[l][i];
+        const err = Math.abs(a - b) / Math.max(1e-8, Math.abs(a) + Math.abs(b));
+        if (err > m) m = err;
+      }
+    }
+    return m;
+  }
+
+  // ---------- datasets (seeded) ----------
+  function dataset(kind, n, seed){
+    const rnd = mulberry32(seed);
+    const X = [], Y = [];
+    if (kind === 'xor'){
+      for (let i = 0; i < n; i++){
+        const x = rnd() * 4 - 2, y = rnd() * 4 - 2;
+        X.push([x, y]); Y.push(x * y > 0 ? 1 : 0);
+      }
+    } else if (kind === 'moons'){
+      for (let i = 0; i < n; i++){
+        const up = i % 2 === 0;
+        const t = rnd() * Math.PI;
+        const r = 1 + (rnd() - 0.5) * 0.35;
+        let x, y;
+        if (up){ x = Math.cos(t) - 0.5; y = Math.sin(t) - 0.25; }
+        else   { x = 0.5 - Math.cos(t); y = 0.25 - Math.sin(t); }
+        X.push([x * r + (rnd() - 0.5) * 0.1, y * r + (rnd() - 0.5) * 0.1]);
+        Y.push(up ? 1 : 0);
+      }
+    } else if (kind === 'circle'){
+      for (let i = 0; i < n; i++){
+        const inner = i % 2 === 0;
+        const t = rnd() * 2 * Math.PI;
+        const r = inner ? rnd() * 0.8 : 1.8 + rnd() * 0.6;
+        X.push([r * Math.cos(t), r * Math.sin(t)]); Y.push(inner ? 1 : 0);
+      }
+    } else { // spiral
+      for (let i = 0; i < n; i++){
+        const cls = i % 2;
+        const t = 1.75 * i / n * 2 * Math.PI + cls * Math.PI;
+        const r = i / n * 4;
+        const x = r * Math.sin(t) + (rnd() - 0.5) * 0.25;
+        const y = r * Math.cos(t) + (rnd() - 0.5) * 0.25;
+        X.push([x, y]); Y.push(cls);
+      }
+    }
+    return { X: X, Y: Y };
+  }
+
+  return { mulberry32, create, forward, predict, lossBCE, grads, applyGrad, trainEpoch, accuracy, numericalGrads, maxRelErr, dataset, sigmoid };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = NN;
+</script>
+
+<script>
+(function(){
+  'use strict';
+  const N = NN;
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  const lossCv = document.getElementById('lossCv'), lctx = lossCv.getContext('2d');
+  let data = null, net = null, epoch = 0, lossHist = [], training = false, timer = null;
+  let seed = 12345;
+
+  function getLR(){ return +document.getElementById('lr').value / 10; }
+  function getArch(){ return document.getElementById('arch').value.split(',').map(Number); }
+
+  function newNet(){ net = N.create([2].concat(getArch(), [1]), seed); epoch = 0; lossHist = []; }
+
+  function regen(){
+    data = N.dataset(document.getElementById('dataset').value, 220, seed);
+    newNet(); draw(); drawLoss();
+    document.getElementById('sEpoch').textContent = '0';
+    document.getElementById('sLoss').textContent = '—';
+    document.getElementById('sAcc').textContent = '—';
+    info('已重新采样（seed ' + seed + '）并重置网络');
+  }
+
+  const R = 2.6; // view range [-R, R]
+  function toPx(x){ return (x + R) / (2 * R) * cv.width; }
+  function fromPy(px){ return px / cv.height * 2 * R - R; }
+
+  function draw(){
+    // decision boundary heat
+    const cell = 10;
+    for (let py = 0; py < cv.height; py += cell){
+      for (let px = 0; px < cv.width; px += cell){
+        const x = px / cv.width * 2 * R - R, y = fromPy(py + cell / 2);
+        const p = N.predict(net, [x, y]);
+        // red (p=0) -> dark -> green (p=1)
+        const r = Math.round(120 * (1 - p)), g = Math.round(120 * p);
+        ctx.fillStyle = 'rgb(' + r + ',' + g + ',40)';
+        ctx.fillRect(px, py, cell, cell);
+      }
+    }
+    // points
+    for (let i = 0; i < data.X.length; i++){
+      const x = data.X[i][0], y = data.X[i][1];
+      ctx.beginPath();
+      ctx.arc(toPx(x), toPx(y), 4, 0, Math.PI * 2);
+      ctx.fillStyle = data.Y[i] === 1 ? '#3fb950' : '#f85149';
+      ctx.fill();
+      ctx.strokeStyle = '#0a0d12'; ctx.lineWidth = 1; ctx.stroke();
+    }
+  }
+
+  function drawLoss(){
+    lctx.fillStyle = '#0a0d12'; lctx.fillRect(0, 0, lossCv.width, lossCv.height);
+    if (lossHist.length < 2) return;
+    const maxL = Math.max(lossHist[0], 0.8), minL = 0;
+    lctx.strokeStyle = '#58a6ff'; lctx.lineWidth = 1.5; lctx.beginPath();
+    for (let i = 0; i < lossHist.length; i++){
+      const px = i / (lossHist.length - 1) * (lossCv.width - 8) + 4;
+      const py = lossCv.height - 8 - (lossHist[i] - minL) / (maxL - minL) * (lossCv.height - 16);
+      i === 0 ? lctx.moveTo(px, py) : lctx.lineTo(px, py);
+    }
+    lctx.stroke();
+    lctx.fillStyle = '#8b949e'; lctx.font = '11px Consolas';
+    lctx.fillText('loss ' + lossHist[lossHist.length - 1].toFixed(4), 8, 14);
+  }
+
+  function info(t){ document.getElementById('info').textContent = '状态：' + t; }
+  function stats(){
+    document.getElementById('sEpoch').textContent = epoch;
+    document.getElementById('sLoss').textContent = lossHist.length ? lossHist[lossHist.length - 1].toFixed(4) : '—';
+    document.getElementById('sAcc').textContent = (N.accuracy(net, data.X, data.Y) * 100).toFixed(1) + '%';
+  }
+
+  function step(k){
+    const lr = getLR();
+    for (let i = 0; i < k; i++){
+      const l = N.trainEpoch(net, data.X, data.Y, lr);
+      epoch++;
+      if (epoch % 5 === 0 || epoch === 1) lossHist.push(l);
+      if (lossHist.length > 400) lossHist.shift();
+    }
+    draw(); drawLoss(); stats();
+  }
+
+  function toggleTrain(){
+    if (training){
+      clearInterval(timer); training = false;
+      document.getElementById('bTrain').textContent = '▶ 训练';
+      document.getElementById('bTrain').classList.remove('active');
+      info('已暂停 · epoch ' + epoch);
+    } else {
+      training = true;
+      document.getElementById('bTrain').textContent = '⏸ 暂停';
+      document.getElementById('bTrain').classList.add('active');
+      timer = setInterval(function(){ step(3); }, 30);
+      info('训练中 · lr=' + getLR() + ' · arch=' + getArch().join('-'));
+    }
+  }
+
+  document.getElementById('bTrain').onclick = toggleTrain;
+  document.getElementById('bRegen').onclick = regen;
+  document.getElementById('bReset').onclick = function(){ newNet(); draw(); drawLoss(); stats(); info('网络已重置（同 seed，权重复现）'); };
+  document.getElementById('dataset').onchange = regen;
+  document.getElementById('lr').oninput = function(){ document.getElementById('lrV').textContent = getLR().toFixed(1); };
+
+  // ---------- self test ----------
+  function T(name, ok, detail){ return { name: name, ok: ok, detail: detail || '' }; }
+  function runTests(){
+    const out = [];
+    // 1) gradient check: analytical vs numerical
+    {
+      const net = N.create([2, 3, 3, 1], 42);
+      const X = [[0.5, -1.2], [1.1, 0.3], [-0.7, 0.8]];
+      const Y = [1, 0, 1];
+      const a = N.grads(net, X, Y);
+      const b = N.numericalGrads(net, X, Y, 1e-6);
+      const err = N.maxRelErr(a, b);
+      out.push(T('梯度检验：解析 == 数值中心差分（maxRelErr < 1e-4）', err < 1e-4, 'err=' + err.toExponential(2)));
+    }
+    // 2) XOR converges with fixed seed
+    {
+      const net = N.create([2, 8, 8, 1], 7);
+      const X = [[0, 0], [0, 1], [1, 0], [1, 1]], Y = [0, 1, 1, 0];
+      let l0 = null, l1 = null;
+      for (let e = 0; e < 4000; e++) l1 = N.trainEpoch(net, X, Y, 1.5);
+      let ok = true;
+      for (let i = 0; i < 4; i++){
+        const p = N.predict(net, X[i]);
+        if (Y[i] === 1 && p < 0.9) ok = false;
+        if (Y[i] === 0 && p > 0.1) ok = false;
+      }
+      out.push(T('XOR 收敛：4000 epoch 后 4 点全部分对（p>0.9 / p<0.1）', ok, 'final loss=' + l1.toFixed(5)));
+    }
+    // 3) determinism: same seed identical weights, different seed differ
+    {
+      const n1 = N.create([2, 4, 1], 99), n2 = N.create([2, 4, 1], 99), n3 = N.create([2, 4, 1], 100);
+      const same = JSON.stringify(Array.from(n1.W[0])) === JSON.stringify(Array.from(n2.W[0]));
+      const diff = JSON.stringify(Array.from(n1.W[0])) !== JSON.stringify(Array.from(n3.W[0]));
+      out.push(T('种子确定性：同 seed 权重逐位一致，异 seed 不同', same && diff));
+    }
+    // 4) BCE properties
+    {
+      const l00 = N.lossBCE(1, 1), l01 = N.lossBCE(0, 0);
+      const pHalf = N.lossBCE(0.5, 1), expect = -Math.log(0.5);
+      const finite = isFinite(l00) && isFinite(l01) && isFinite(pHalf);
+      out.push(T('BCE 性质：p==y → 0 · −log0.5 已知值 · 全有限', finite && l00 < 1e-9 && l01 < 1e-9 && Math.abs(pHalf - expect) < 1e-9));
+    }
+    // 5) moons dataset training accuracy
+    {
+      const d = N.dataset('moons', 200, 2024);
+      const net = N.create([2, 8, 8, 1], 5);
+      for (let e = 0; e < 800; e++) N.trainEpoch(net, d.X, d.Y, 1.0);
+      const acc = N.accuracy(net, d.X, d.Y);
+      out.push(T('双月牙：800 epoch 训练精度 > 95%', acc > 0.95, 'acc=' + (acc * 100).toFixed(1) + '%'));
+    }
+    // 6) spiral dataset training accuracy
+    {
+      const d = N.dataset('spiral', 300, 11);
+      const net = N.create([2, 16, 16, 1], 3);
+      for (let e = 0; e < 1500; e++) N.trainEpoch(net, d.X, d.Y, 1.0);
+      const acc = N.accuracy(net, d.X, d.Y);
+      out.push(T('双螺旋：1500 epoch 训练精度 > 90%', acc > 0.90, 'acc=' + (acc * 100).toFixed(1) + '%'));
+    }
+    // 7) loss decreases significantly
+    {
+      const d = N.dataset('circle', 150, 77);
+      const net = N.create([2, 8, 1], 9);
+      const l0 = N.trainEpoch(net, d.X, d.Y, 1.0);
+      let l1 = 0;
+      for (let e = 0; e < 600; e++) l1 = N.trainEpoch(net, d.X, d.Y, 1.0);
+      out.push(T('损失下降：600 epoch 后 loss < 初始的 1/5', l1 < l0 / 5, l0.toFixed(4) + ' → ' + l1.toFixed(4)));
+    }
+    // 8) predict bounded & finite on 200 random inputs
+    {
+      const net = N.create([2, 8, 8, 1], 1);
+      const rnd = N.mulberry32(1234);
+      let ok = true;
+      for (let i = 0; i < 200; i++){
+        const p = N.predict(net, [rnd() * 10 - 5, rnd() * 10 - 5]);
+        if (!(p >= 0 && p <= 1) || !isFinite(p)){ ok = false; break; }
+      }
+      out.push(T('输出有界：200 随机输入 predict ∈ [0,1] 且有限', ok));
+    }
+
+    const box = document.getElementById('tout');
+    box.innerHTML = '';
+    let pass = 0;
+    for (const t of out){
+      const d = document.createElement('div');
+      d.className = 't ' + (t.ok ? 'pass' : 'fail');
+      d.textContent = (t.ok ? '✓ ' : '✗ ') + t.name + (t.detail ? '  [' + t.detail + ']' : '');
+      box.appendChild(d);
+      if (t.ok) pass++;
+    }
+    const s = document.createElement('div');
+    s.className = 't ' + (pass === out.length ? 'pass' : 'fail');
+    s.textContent = '—— ' + pass + '/' + out.length + ' ——';
+    box.appendChild(s);
+    info('自检完成：' + pass + '/' + out.length);
+  }
+  document.getElementById('bTest').onclick = runTests;
+
+  document.getElementById('lrV').textContent = getLR().toFixed(1);
+  regen();
+})();
+</script>
+</body>
+</html>
